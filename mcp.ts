@@ -316,12 +316,12 @@ function readBody(req: IncomingMessage): Promise<string> {
  * Handle POST /mcp. Returns true when the request was this route (handled),
  * false otherwise so the router can fall through.
  */
-export async function handleMcp(req: IncomingMessage, res: ServerResponse, store: Store, token: string): Promise<boolean> {
+export async function handleMcp(req: IncomingMessage, res: ServerResponse, store: Store, auth: string): Promise<boolean> {
   const url = req.url ?? '';
   const path = url.split('?')[0];
   if (req.method !== 'POST' || path !== '/mcp') return false;
   const sessionId = typeof req.headers['mcp-session-id'] === 'string' ? req.headers['mcp-session-id'] : null;
-  if (!token || req.headers.authorization !== `Bearer ${token}`) {
+  if (!auth || req.headers.authorization !== auth) {
     sendJson(res, 401, { message: 'Unauthorized' }, sessionId);
     return true;
   }

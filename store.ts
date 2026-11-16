@@ -8,6 +8,8 @@ export interface IssueComment { id: number; body: string; seq: number; }
 export interface Issue {
   id: number; number: number; title: string; body: string | null;
   state: 'open' | 'closed'; labels: string[]; comments: IssueComment[]; seq: number;
+  /** Cached serialized REST JSON for this issue (Buffer) + the owner it was built for; null when stale. */
+  jsonBuf: Buffer | null; jsonOwner: string | null;
 }
 export interface Pull {
   id: number; number: number; title: string; body: string | null;
@@ -28,6 +30,12 @@ export interface Repo {
   issues: Issue[]; pulls: Pull[];
   nextIssue: number; nextPull: number; nextComment: number;
   seq: number;
+  /** Git smart-HTTP response caches (ls-refs / fetch / v0 advertisement), keyed by a
+   * fingerprint of the refs + object count. Objects are immutable by sha and only ever
+   * added, so (refs fingerprint + object count) fully determines the git responses. */
+  lsRefsCache: Map<string, Buffer>;
+  fetchCache: Map<string, Buffer>;
+  v0AdvCache: Map<string, Buffer>;
 }
 
 export const FIXED_GIT_TIME = 1700000000;
@@ -64,6 +72,7 @@ export class Store {
       refs: new Map(), objects: new Map(), labels: new Map(),
       issues: [], pulls: [], nextIssue: 1, nextPull: 1, nextComment: 1,
       seq: this.nextSeq(),
+      lsRefsCache: new Map(), fetchCache: new Map(), v0AdvCache: new Map(),
     };
     this.reposByName.set(name, repo);
     return repo;
@@ -92,6 +101,7 @@ export class Store {
     const issue: Issue = {
       id: repo.id * 100000 + repo.nextIssue, number: repo.nextIssue, title,
       body: body ?? null, state: 'open', labels: [...labels], comments: [], seq: this.nextSeq(),
+      jsonBuf: null, jsonOwner: null,
     };
     repo.nextIssue += 1;
     repo.issues.push(issue);
@@ -113,6 +123,15 @@ export class Store {
     const c: IssueComment = { id: repo.id * 1000000 + repo.nextComment, body, seq: this.nextSeq() };
     repo.nextComment += 1;
     issue.comments.push(c);
+    issue.jsonBuf = null; // the comments count in the cached JSON changed
     return c;
+  }
+
+  /** Drop one issue's cached REST JSON (call after any direct field mutation). */
+  touchIssue(issue: Issue): void { issue.jsonBuf = null; }
+
+  /** Drop every issue's cached REST JSON in a repo (call when a label is re-created). */
+  clearIssueCaches(repo: Repo): void {
+    for (const issue of repo.issues) issue.jsonBuf = null;
   }
 }

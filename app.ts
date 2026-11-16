@@ -16,18 +16,16 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
 }
 
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  const url = req.url ?? '/';
+  const q = url.indexOf('?');
+  return q >= 0 ? url.slice(0, q) : url;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -36,6 +34,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 export function createApp(): Server {
   const store = new Store();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  // Precomputed auth header; empty when no token is configured (GraphQL/MCP then 401
+  // everything, exactly as the `!token` guard did before). The token never changes per process.
+  const auth = token === '' ? '' : `Bearer ${token}`;
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
@@ -47,16 +48,16 @@ export function createApp(): Server {
           return;
         }
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          if (await handleRest(req, res, store, token)) return;
+          if (await handleRest(req, res, store, auth)) return;
         }
         if (method === 'POST' && path === '/api/graphql') {
-          if (await handleGraphQL(req, res, store, token)) return;
+          if (await handleGraphQL(req, res, store, auth)) return;
         }
         if (method === 'POST' && path === '/mcp') {
-          if (await handleMcp(req, res, store, token)) return;
+          if (await handleMcp(req, res, store, auth)) return;
         }
         if (path.includes('.git/') || path.endsWith('.git')) {
-          if (await handleGit(req, res, store, token)) return;
+          if (await handleGit(req, res, store, auth)) return;
         }
         sendJson(res, 404, { message: 'Not Found' });
       } catch (err) {

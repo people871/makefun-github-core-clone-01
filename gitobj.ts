@@ -10,7 +10,7 @@ export function sha1Hex(data: Buffer): string {
 /** The git object id of a (type, content) pair: sha1("type len\0" + content). */
 export function objectId(type: 'commit' | 'tree' | 'blob' | 'tag', content: Buffer): string {
   const header = Buffer.from(`${type} ${content.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, content]));
+  return createHash('sha1').update(header).update(content).digest('hex');
 }
 
 export function buildBlob(content: Buffer): { sha: string; raw: Buffer } {
@@ -109,6 +109,13 @@ export function isAncestor(
   ancestor: string, descendant: string,
 ): boolean {
   if (ancestor === descendant) return true;
+  // Fast path: the common case (a push) is a direct parent link.
+  const head = objects.get(descendant);
+  if (head && head.type === 'commit') {
+    const c = parseCommit(head.data);
+    if (c.parents.includes(ancestor)) return true;
+    if (c.parents.length === 0) return false;
+  }
   const seen = new Set<string>();
   const stack = [descendant];
   while (stack.length > 0) {

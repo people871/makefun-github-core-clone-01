@@ -852,6 +852,7 @@ function executeOperation(ctx: Ctx, op: Operation): Record<string, unknown> {
           break;
         }
         found.issue.state = 'closed';
+        store.touchIssue(found.issue); // the cached REST JSON no longer matches the issue
         data[key] = resolveObject(ctx, 'Payload', {
           __kind: 'Payload',
           fields: { issue: issueTarget(found.repo, found.issue) },
@@ -974,11 +975,11 @@ function readBody(req: IncomingMessage): Promise<string> {
  * Handle POST /api/graphql. Returns true when the request was this route
  * (handled), false otherwise so the router can fall through.
  */
-export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, store: Store, token: string): Promise<boolean> {
+export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, store: Store, auth: string): Promise<boolean> {
   const url = req.url ?? '';
   const path = url.split('?')[0];
   if (req.method !== 'POST' || path !== '/api/graphql') return false;
-  if (!token || req.headers.authorization !== `Bearer ${token}`) {
+  if (!auth || req.headers.authorization !== auth) {
     sendJson(res, 401, { message: 'Unauthorized' });
     return true;
   }

@@ -161,6 +161,23 @@ export function parsePack(pack: Buffer, resolveBase?: (oid: string) => GitObject
   }
   if (off !== trailerStart) throw new Error('pack has stray bytes before its trailer');
 
+  // Fast path: no deltas — every entry is a plain object, so resolve each directly
+  // without the delta machinery (no byOffset lookups, no recursion, no resolving set).
+  // Push packs built by the kit client are always plain; deltas fall through below.
+  let hasDelta = false;
+  for (const entry of raw) {
+    if (entry.typeCode === 6 || entry.typeCode === 7) { hasDelta = true; break; }
+  }
+  if (!hasDelta) {
+    const objects = new Map<string, GitObject>();
+    for (const entry of raw) {
+      const obj: GitObject = { type: CODE_TO_TYPE[entry.typeCode] as GitObject['type'], data: entry.data };
+      const oid = objectId(obj.type, obj.data);
+      if (!objects.has(oid)) objects.set(oid, obj);
+    }
+    return { version, count, objects };
+  }
+
   const resolvedByOid = new Map<string, Raw>();
   const resolving = new Set<number>();
   const resolve = (entry: Raw): GitObject => {

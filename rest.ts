@@ -43,16 +43,31 @@ function send(res: ServerResponse, store: Store, status: number, body: unknown, 
   res.end(text);
 }
 
+/** Send a pre-serialized JSON buffer (no re-stringify, no byteLength): used for cached issue JSON. */
+function sendBuf(res: ServerResponse, store: Store, status: number, buf: Buffer, extra?: Record<string, string>): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': store.nextRequestId(),
+    'content-length': String(buf.length),
+  };
+  if (extra) for (const k of Object.keys(extra)) headers[k] = extra[k] as string;
+  res.writeHead(status, headers);
+  res.end(buf);
+}
+
 function sendErr(res: ServerResponse, store: Store, status: number, message: string): void {
   send(res, store, status, { message });
 }
 
 function readBodyText(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
-    let data = '';
-    req.on('data', (c: Buffer) => { data += c.toString('utf8'); });
-    req.on('end', () => resolve(data));
-    req.on('error', () => resolve(data));
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      if (chunks.length === 0) { resolve(''); return; }
+      resolve((chunks.length === 1 ? chunks[0] as Buffer : Buffer.concat(chunks)).toString('utf8'));
+    });
+    req.on('error', () => resolve(''));
   });
 }
 
@@ -126,6 +141,21 @@ function issueJson(repo: Repo, store: Store, issue: Issue): Record<string, unkno
     updated_at: FIXED_TS,
     closed_at: issue.state === 'closed' ? FIXED_TS : null,
   };
+}
+
+/**
+ * The issue's REST JSON as a string, byte-identical to JSON.stringify(issueJson(...)):
+ * same key order, same separators, string fields escaped through JSON.stringify.
+ * Built without the intermediate object graph (the write workload creates one issue per
+ * request, so the object build + stringify was paid on every call).
+ */
+function issueJsonText(repo: Repo, store: Store, issue: Issue): string {
+  const owner = ownerOf(repo, store);
+  let labels = '[]';
+  if (issue.labels.length > 0) {
+    labels = `[${issue.labels.map((name) => JSON.stringify(labelJson(repo, store, name))).join(',')}]`;
+  }
+  return `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body ?? '')},"state":${JSON.stringify(issue.state)},"labels":${labels},"comments":${issue.comments.length},"user":{"login":${JSON.stringify(owner)},"id":${store.viewerId},"type":"User"},"assignee":null,"milestone":null,"locked":false,"html_url":${JSON.stringify(`https://example.invalid/${owner}/${repo.name}/issues/${issue.number}`)},"url":${JSON.stringify(`https://api.example.invalid/repos/${owner}/${repo.name}/issues/${issue.number}`)},"created_at":${JSON.stringify(FIXED_TS)},"updated_at":${JSON.stringify(FIXED_TS)},"closed_at":${issue.state === 'closed' ? JSON.stringify(FIXED_TS) : 'null'}}`;
 }
 
 function pullJson(repo: Repo, store: Store, pull: Pull): Record<string, unknown> {
@@ -329,7 +359,7 @@ function blobData(repo: Repo, sha: string): Buffer {
 // ---------------------------------------------------------------------------------------------
 // Handlers
 
-export async function handleRest(req: IncomingMessage, res: ServerResponse, store: Store, token: string): Promise<boolean> {
+export async function handleRest(req: IncomingMessage, res: ServerResponse, store: Store, auth: string): Promise<boolean> {
   const rawUrl = req.url ?? '/';
   const qIndex = rawUrl.indexOf('?');
   const rawPath = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
@@ -337,14 +367,25 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
   const queryString = qIndex >= 0 ? rawUrl.slice(qIndex + 1) : '';
   const method = (req.method ?? 'GET').toUpperCase();
 
-  // Auth: every /api/v3 request needs the bearer token.
-  const auth = req.headers.authorization;
-  if (auth !== `Bearer ${token}`) {
+  // Auth: every /api/v3 request needs the bearer <redacted>
+  if (req.headers.authorization !== auth) {
     sendErr(res, store, 401, 'Bad credentials');
     return true;
   }
 
-  const segments = rawPath.split('/').filter((s) => s.length > 0).map(dec);
+  // Split the path into segments without filter/map allocations; decode a segment only
+  // when it actually carries a %-escape (the bench paths never do).
+  const segments: string[] = [];
+  let segStart = 0;
+  for (let i = 0; i <= rawPath.length; i++) {
+    if (i === rawPath.length || rawPath.charCodeAt(i) === 0x2f) {
+      if (i > segStart) {
+        const seg = rawPath.slice(segStart, i);
+        segments.push(seg.indexOf('%') >= 0 ? dec(seg) : seg);
+      }
+      segStart = i + 1;
+    }
+  }
   // segments[0] = 'api', segments[1] = 'v3'
   const tail = segments.slice(2);
   const lazyQuery = (): URLSearchParams => new URLSearchParams(queryString);
@@ -797,6 +838,8 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
         color,
         description: typeof body.description === 'string' ? body.description : null,
       });
+      // A re-created label can change the color/description embedded in cached issue JSON.
+      store.clearIssueCaches(repo);
       send(res, store, 201, {
         name: body.name,
         color,
@@ -849,7 +892,10 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           labels.push(labelName);
         }
         const issue = store.createIssue(repo, body.title, typeof body.body === 'string' ? body.body : null, labels);
-        send(res, store, 201, issueJson(repo, store, issue));
+        const createdBuf = Buffer.from(issueJsonText(repo, store, issue), 'utf8');
+        issue.jsonBuf = createdBuf;
+        issue.jsonOwner = ownerOf(repo, store);
+        sendBuf(res, store, 201, createdBuf);
         return true;
       }
       sendErr(res, store, 404, 'Not Found');
@@ -874,7 +920,17 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
       }
       if (rest.length === 2) {
         if (method === 'GET') {
-          send(res, store, 200, issueJson(repo, store, issue));
+          // The same issue is often read thousands of times unchanged: serve the cached
+          // serialized JSON (keyed by owner, so a re-pin rebuilds it).
+          const owner = ownerOf(repo, store);
+          if (issue.jsonBuf !== null && issue.jsonOwner === owner) {
+            sendBuf(res, store, 200, issue.jsonBuf);
+            return true;
+          }
+          const buf = Buffer.from(issueJsonText(repo, store, issue), 'utf8');
+          issue.jsonBuf = buf;
+          issue.jsonOwner = owner;
+          sendBuf(res, store, 200, buf);
           return true;
         }
         if (method === 'PATCH') {
@@ -906,7 +962,11 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
             }
             issue.labels = labels;
           }
-          send(res, store, 200, issueJson(repo, store, issue));
+          store.touchIssue(issue); // the cached JSON no longer matches the issue
+          const patchedBuf = Buffer.from(issueJsonText(repo, store, issue), 'utf8');
+          issue.jsonBuf = patchedBuf;
+          issue.jsonOwner = ownerOf(repo, store);
+          sendBuf(res, store, 200, patchedBuf);
           return true;
         }
         sendErr(res, store, 404, 'Not Found');

@@ -22,17 +22,51 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-/** One pkt-line: 4 hex length bytes (payload + 4) then the payload. */
-function pkt(payload: string | Buffer): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+/**
+ * Assemble pkt-lines into ONE buffer in a single pass (no per-line alloc+concat).
+ * Each entry becomes its 4-hex length prefix followed by the payload; the FLUSH
+ * sentinel is emitted raw as `0000` (a flush line carries no length prefix of its own).
+ */
+function pktJoin(lines: ReadonlyArray<string | Buffer>): Buffer {
+  let total = 0;
+  const bufs: Buffer[] = new Array(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    const entry = lines[i] as string | Buffer;
+    if (entry === FLUSH) { bufs[i] = FLUSH; total += 4; continue; }
+    const data = typeof entry === 'string' ? Buffer.from(entry, 'utf8') : entry;
+    bufs[i] = data;
+    total += 4 + data.length;
+  }
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (const data of bufs) {
+    if (data === FLUSH) { out.write('0000', off, 4, 'ascii'); off += 4; continue; }
+    out.write((data.length + 4).toString(16).padStart(4, '0'), off, 4, 'ascii');
+    data.copy(out, off + 4);
+    off += 4 + data.length;
+  }
+  return out;
+}
+
+/** A fingerprint of everything a git smart-HTTP response depends on: the refs (name=oid)
+ * plus the object count. Objects are immutable by sha and only ever added, so this pair
+ * fully determines ls-refs / fetch / advertisement bytes for a repo. */
+function gitFingerprint(repo: Repo): string {
+  let fp = `n${repo.objects.size}|`;
+  for (const [name, oid] of repo.refs) fp += `${name}=${oid};`;
+  return fp;
+}
+
+/** Store a cached response, dropping the whole cache if it grows past a bound (a cache is
+ * only a cache: dropping it never changes a response). */
+function cachePut(map: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (map.size >= 1024) map.clear();
+  map.set(key, value);
 }
 
 interface Pkt {
@@ -85,7 +119,8 @@ function parseGitPath(path: string): { owner: string; repo: string; rest: string
   if (after !== '' && after.charCodeAt(0) !== 0x2f) return null;
   let o = owner;
   let r = repo;
-  try { o = decodeURIComponent(owner); r = decodeURIComponent(repo); } catch { /* keep raw */ }
+  if (owner.indexOf('%') >= 0) { try { o = decodeURIComponent(owner); } catch { /* keep raw */ } }
+  if (repo.indexOf('%') >= 0) { try { r = decodeURIComponent(repo); } catch { /* keep raw */ } }
   if (!o || !r) return null;
   return { owner: o, repo: r, rest: after === '' ? '' : after.slice(1) };
 }
@@ -132,41 +167,50 @@ function isTagObject(repo: Repo, oid: string): boolean {
 // v2 advertisement + v0 advertisements
 // -------------------------------------------------------------------------------------------
 
+/** The v2 capability advertisement is the same for every repo: build once, send forever. */
+const V2_ADVERTISEMENT: Buffer = pktJoin([
+  'version 2\n',
+  'agent=forge/1.0\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  FLUSH,
+]);
+
 function sendV2Advertisement(res: ServerResponse): void {
-  const parts = [
-    pkt('version 2\n'),
-    pkt('agent=forge/1.0\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow filter\n'),
-    pkt('object-format=sha1\n'),
-    FLUSH,
-  ];
-  const body = Buffer.concat(parts);
-  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-advertisement', 'content-length': body.length });
-  res.end(body);
+  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-advertisement', 'content-length': V2_ADVERTISEMENT.length });
+  res.end(V2_ADVERTISEMENT);
 }
 
 function sendV0Advertisement(res: ServerResponse, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): void {
+  const key = `${service}|${gitFingerprint(repo)}`;
+  const cached = repo.v0AdvCache.get(key);
+  if (cached !== undefined) {
+    res.writeHead(200, { 'content-type': `application/x-${service}-advertisement`, 'content-length': cached.length });
+    res.end(cached);
+    return;
+  }
   const refs = sortedRefs(repo);
   const head = headOid(repo);
   const caps = service === 'git-receive-pack'
     ? `report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=forge/1.0 symref=HEAD:${headRefName(repo)}`
     : `side-band-64k ofs-delta agent=forge/1.0 symref=HEAD:${headRefName(repo)}`;
-  const parts: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
+  const lines: Array<string | Buffer> = [`# service=${service}\n`, FLUSH];
   if (refs.length === 0) {
-    parts.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
     const headLine = head ?? refs[0].oid;
-    parts.push(pkt(`${headLine} HEAD\0${caps}\n`));
+    lines.push(`${headLine} HEAD\0${caps}\n`);
     for (const ref of refs) {
-      parts.push(pkt(`${ref.oid} ${ref.name}\n`));
+      lines.push(`${ref.oid} ${ref.name}\n`);
       if (isTagObject(repo, ref.oid) && ref.name.startsWith('refs/tags/')) {
-        parts.push(pkt(`${peelOid(repo, ref.oid)} ${ref.name}^{}\n`));
+        lines.push(`${peelOid(repo, ref.oid)} ${ref.name}^{}\n`);
       }
     }
   }
-  parts.push(FLUSH);
-  const body = Buffer.concat(parts);
+  lines.push(FLUSH);
+  const body = pktJoin(lines);
+  cachePut(repo.v0AdvCache, key, body);
   res.writeHead(200, { 'content-type': `application/x-${service}-advertisement`, 'content-length': body.length });
   res.end(body);
 }
@@ -293,25 +337,33 @@ function handleLsRefs(repo: Repo, args: string[], res: ServerResponse): void {
     else if (arg === 'unborn') unborn = true;
     else if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
   }
-  const parts: Buffer[] = [];
+  const key = `${args.join('\n')}|${gitFingerprint(repo)}`;
+  const cached = repo.lsRefsCache.get(key);
+  if (cached !== undefined) {
+    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': cached.length });
+    res.end(cached);
+    return;
+  }
+  const lines: Array<string | Buffer> = [];
   const head = headOid(repo);
   const refs = sortedRefs(repo);
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   if (prefixes.length === 0) {
     if (head !== null) {
-      parts.push(pkt(`${head} HEAD${symrefs ? ` symref-target:${headRefName(repo)}` : ''}\n`));
+      lines.push(`${head} HEAD${symrefs ? ` symref-target:${headRefName(repo)}` : ''}\n`);
     } else if (unborn) {
-      parts.push(pkt(`unborn HEAD${symrefs ? ` symref-target:${headRefName(repo)}` : ''}\n`));
+      lines.push(`unborn HEAD${symrefs ? ` symref-target:${headRefName(repo)}` : ''}\n`);
     }
   }
   for (const ref of refs) {
     if (!keep(ref.name)) continue;
     let line = `${ref.oid} ${ref.name}`;
     if (peel && isTagObject(repo, ref.oid)) line += ` peeled:${peelOid(repo, ref.oid)}`;
-    parts.push(pkt(`${line}\n`));
+    lines.push(`${line}\n`);
   }
-  parts.push(FLUSH);
-  const body = Buffer.concat(parts);
+  lines.push(FLUSH);
+  const body = pktJoin(lines);
+  cachePut(repo.lsRefsCache, key, body);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': body.length });
   res.end(body);
 }
@@ -336,35 +388,45 @@ function handleFetchV2(repo: Repo, args: string[], res: ServerResponse): void {
     }
     // thin-pack, no-progress, ofs-delta, done, deepen-since, deepen-not: no server action needed.
   }
+  // The fetch answer is fully determined by the request args + the repo state fingerprint
+  // (objects are immutable by sha; refs + object count pin the rest), so identical clones
+  // share one cached response.
+  const key = `w:${wants.join(',')}|h:${haves.join(',')}|s:${shallow.join(',')}|d:${depth ?? ''}|f:${filter ?? ''}|${gitFingerprint(repo)}`;
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) {
+    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': cached.length });
+    res.end(cached);
+    return;
+  }
   const plan = computeFetch(repo, wants, haves, shallow, depth, filter);
   const pack = buildPack(plan.packObjects);
 
-  const parts: Buffer[] = [];
+  const lines: Array<string | Buffer> = [];
   // acknowledgments section
-  parts.push(pkt('acknowledgments\n'));
+  lines.push('acknowledgments\n');
   if (plan.acks.length > 0) {
-    for (const ack of plan.acks) parts.push(pkt(`ACK ${ack}\n`));
-    parts.push(pkt('ready\n'));
+    for (const ack of plan.acks) lines.push(`ACK ${ack}\n`);
+    lines.push('ready\n');
   } else {
-    parts.push(pkt('NAK\n'));
+    lines.push('NAK\n');
   }
-  parts.push(FLUSH);
+  lines.push(FLUSH);
   // shallow-info section (only when there is something to report)
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    parts.push(pkt('shallow-info\n'));
-    for (const s of plan.shallow) parts.push(pkt(`shallow ${s}\n`));
-    for (const s of plan.unshallow) parts.push(pkt(`unshallow ${s}\n`));
-    parts.push(FLUSH);
+    lines.push('shallow-info\n');
+    for (const s of plan.shallow) lines.push(`shallow ${s}\n`);
+    for (const s of plan.unshallow) lines.push(`unshallow ${s}\n`);
+    lines.push(FLUSH);
   }
   // packfile section, sideband band 1
-  parts.push(pkt('packfile\n'));
+  lines.push('packfile\n');
   for (let off = 0; off < pack.length; off += SIDEBAND_CHUNK) {
     const chunk = pack.subarray(off, Math.min(pack.length, off + SIDEBAND_CHUNK));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    parts.push(pkt(payload));
+    lines.push(Buffer.concat([Buffer.from([1]), chunk]));
   }
-  parts.push(FLUSH);
-  const body = Buffer.concat(parts);
+  lines.push(FLUSH);
+  const body = pktJoin(lines);
+  cachePut(repo.fetchCache, key, body);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'content-length': body.length });
   res.end(body);
 }
@@ -401,29 +463,89 @@ interface PushCommand {
   ref: string;
 }
 
+/** Build a report-status response in ONE buffer (no per-line alloc+concat). Byte-identical
+ * to the pkt()/concat construction it replaces: each line is an inner pkt-line, wrapped in
+ * a band-1 outer pkt-line when sideband is on, ending with a band-1 flush + bare flush. */
+function buildReceiveReport(lines: string[], sideband: boolean): Buffer {
+  const lineBufs: Buffer[] = new Array(lines.length);
+  let total = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lb = Buffer.from(lines[i] as string, 'utf8');
+    lineBufs[i] = lb;
+    total += sideband ? 9 + lb.length : 4 + lb.length;
+  }
+  total += sideband ? 13 : 4;
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (const lb of lineBufs) {
+    if (sideband) {
+      out.write((9 + lb.length).toString(16).padStart(4, '0'), off, 4, 'ascii'); off += 4;
+      out[off++] = 1;
+    }
+    out.write((4 + lb.length).toString(16).padStart(4, '0'), off, 4, 'ascii'); off += 4;
+    lb.copy(out, off); off += lb.length;
+  }
+  if (sideband) {
+    out.write('0009', off, 4, 'ascii'); off += 4;
+    out[off++] = 1;
+    out.write('0000', off, 4, 'ascii'); off += 4;
+    out.write('0000', off, 4, 'ascii'); off += 4;
+  } else {
+    out.write('0000', off, 4, 'ascii'); off += 4;
+  }
+  return out;
+}
+
 function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void {
-  const { packets, restOffset } = decodePktLines(body);
-  const commands: PushCommand[] = [];
+  // Fast path: the common push is exactly one command pkt-line, a flush, then the raw pack.
+  // Anything else falls back to the full pkt-line decoder below (identical behaviour).
+  let commands: PushCommand[] | null = null;
   let sideband = true;
-  let first = true;
-  for (const p of packets) {
-    if (p.kind === 'flush') break;
-    if (p.kind !== 'data') continue;
-    let line = p.payload.toString('utf8').replace(/\n$/, '');
-    if (first) {
-      first = false;
-      const nul = line.indexOf('\0');
-      if (nul >= 0) {
-        // Capabilities the client sent (report-status, side-band-64k, ...).
-        sideband = line.slice(nul + 1).split(' ').includes('side-band-64k');
-        line = line.slice(0, nul);
+  let restOffset = -1;
+  if (body.length >= 8) {
+    const head = body.subarray(0, 4).toString('ascii');
+    if (HEX4.test(head)) {
+      const len = parseInt(head, 16);
+      if (len >= 5 && len <= body.length - 4 && body.subarray(len, len + 4).toString('ascii') === '0000') {
+        let line = body.subarray(4, len).toString('utf8');
+        if (line.endsWith('\n')) line = line.slice(0, -1);
+        const nul = line.indexOf('\0');
+        if (nul >= 0) {
+          sideband = line.slice(nul + 1).split(' ').includes('side-band-64k');
+          line = line.slice(0, nul);
+        }
+        const parts = line.split(' ');
+        if (parts.length >= 3) {
+          commands = [{ oldOid: parts[0] as string, newOid: parts[1] as string, ref: parts[2] as string }];
+          restOffset = len + 4;
+        }
       }
     }
-    const parts = line.split(' ');
-    if (parts.length < 3) throw new Error(`bad receive-pack command ${JSON.stringify(line.slice(0, 60))}`);
-    commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts[2] });
   }
-  if (commands.length === 0) throw new Error('receive-pack with no commands');
+  if (commands === null) {
+    const { packets, restOffset: ro } = decodePktLines(body);
+    const list: PushCommand[] = [];
+    let first = true;
+    for (const p of packets) {
+      if (p.kind === 'flush') break;
+      if (p.kind !== 'data') continue;
+      let line = p.payload.toString('utf8').replace(/\n$/, '');
+      if (first) {
+        first = false;
+        const nul = line.indexOf('\0');
+        if (nul >= 0) {
+          sideband = line.slice(nul + 1).split(' ').includes('side-band-64k');
+          line = line.slice(0, nul);
+        }
+      }
+      const parts = line.split(' ');
+      if (parts.length < 3) throw new Error(`bad receive-pack command ${JSON.stringify(line.slice(0, 60))}`);
+      list.push({ oldOid: parts[0], newOid: parts[1], ref: parts[2] });
+    }
+    if (list.length === 0) throw new Error('receive-pack with no commands');
+    commands = list;
+    restOffset = ro;
+  }
 
   // The pack (if any) follows the flush pkt-line, raw.
   let unpackOk = true;
@@ -479,45 +601,41 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
     lines.push(ok ? `ok ${cmd.ref}\n` : `ng ${cmd.ref} ${reason}\n`);
   }
 
-  const reportParts: Buffer[] = [];
-  for (const line of lines) {
-    const inner = pkt(line);
-    reportParts.push(sideband ? pkt(Buffer.concat([Buffer.from([1]), inner])) : inner);
-  }
-  // The report-status stream itself ends with a flush pkt-line.
-  reportParts.push(sideband ? pkt(Buffer.concat([Buffer.from([1]), FLUSH])) : FLUSH);
-  if (sideband) reportParts.push(FLUSH);
-  const responseBody = Buffer.concat(reportParts);
-  res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result', 'content-length': responseBody.length });
-  res.end(responseBody);
+  const reportBody = buildReceiveReport(lines, sideband);
+  res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result', 'content-length': reportBody.length });
+  res.end(reportBody);
 }
 
 // -------------------------------------------------------------------------------------------
 // entry point
 // -------------------------------------------------------------------------------------------
 
-export async function handleGit(req: IncomingMessage, res: ServerResponse, store: Store, token: string): Promise<boolean> {
-  let pathname: string;
-  let query: URLSearchParams;
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    pathname = url.pathname;
-    query = url.searchParams;
-  } catch {
-    return false;
-  }
+export async function handleGit(req: IncomingMessage, res: ServerResponse, store: Store, auth: string): Promise<boolean> {
+  const rawUrl = req.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
   const parsed = parseGitPath(pathname);
   if (!parsed) return false;
+  // The only query parameter the git surface reads.
+  let service: string | null = null;
+  if (qIndex >= 0) {
+    const qs = rawUrl.slice(qIndex + 1);
+    const si = qs.indexOf('service=');
+    if (si >= 0) {
+      const amp = qs.indexOf('&', si + 8);
+      service = amp >= 0 ? qs.slice(si + 8, amp) : qs.slice(si + 8);
+      if (service.indexOf('%') >= 0) { try { service = decodeURIComponent(service); } catch { /* keep raw */ } }
+    }
+  }
 
   try {
-    if ((req.headers.authorization ?? '') !== `Bearer ${token}`) {
+    if ((req.headers.authorization ?? '') !== auth) {
       sendJson(res, 401, { message: 'Unauthorized' });
       return true;
     }
     const method = req.method ?? 'GET';
     const repo = store.resolveRepo(parsed.owner, parsed.repo);
     if (method === 'GET' && parsed.rest === 'info/refs') {
-      const service = query.get('service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, 404, { message: 'Not Found' });
         return true;
